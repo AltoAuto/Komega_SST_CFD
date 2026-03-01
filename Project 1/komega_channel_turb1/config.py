@@ -53,7 +53,7 @@ TIME = {
     "cfl_diff":0.5,
     "dt_max":0.1,
     "dt_min": 0.0,
-    "max_steps":100000,
+    "max_steps":100,
 }
 RESTART = {
     "enabled": False,

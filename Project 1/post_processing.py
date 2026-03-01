@@ -898,3 +898,318 @@ def plot_timing(log_path_or_dir, dpi=120, output_dir=None):
     fig.savefig(save_path, dpi=dpi)
     plt.show()
     return fig, ax, save_path
+
+
+# ===========================================================================
+# PyVista visualization  (high-quality 3D-capable rendering)
+# ===========================================================================
+
+def _pyvista_import():
+    """Lazy import so matplotlib-only users are not forced to install PyVista."""
+    try:
+        import pyvista as pv
+        return pv
+    except ImportError as exc:
+        raise ImportError(
+            "PyVista is required for pyvista_* functions.  "
+            "Install with: pip install pyvista"
+        ) from exc
+
+
+def _pyvista_build_grid(mesh_data, phi, label):
+    """Build a PyVista StructuredGrid with a scalar cell-data array."""
+    pv = _pyvista_import()
+    node = mesh_data["node"]    # (Ni+1, Nj+1, 2)
+    x = node[:, :, 0]
+    y = node[:, :, 1]
+    z = np.zeros_like(x)
+    grid = pv.StructuredGrid(x, y, z)
+    # VTK StructuredGrid cell ordering: i varies fastest (Fortran / F-order)
+    grid.cell_data[label] = phi.flatten(order="F")
+    return grid
+
+
+def _pyvista_resolve_field(state, mesh_data, field):
+    """Extract a scalar field array (interior only) and its display label."""
+    node = mesh_data["node"]
+    count_i = node.shape[0] - 1
+    count_j = node.shape[1] - 1
+    key = field.lower()
+    if key in ("speed", "vmag", "velocity"):
+        u = _cell_field(state, "u", count_i, count_j)
+        v = _cell_field(state, "v", count_i, count_j)
+        return np.hypot(u, v), "velocity magnitude", key
+    field_map = {"u": "u", "v": "v", "p": "p", "k": "k",
+                 "omega": "omega", "nu_t": "nu_t"}
+    if key not in field_map:
+        raise ValueError(
+            f"field must be one of: speed, u, v, p, k, omega, nu_t  (got '{field}')"
+        )
+    return _cell_field(state, key, count_i, count_j), key, key
+
+
+def pyvista_field(
+    state_path_or_dir,
+    mesh_path_or_dir,
+    field="speed",
+    cmap="viridis",
+    output_dir=None,
+    window_size=(1400, 500),
+    show_edges=False,
+    show_bounds=True,
+):
+    """
+    Render a 2D scalar field using PyVista and save a high-quality screenshot.
+
+    Produces a *_pv.png file alongside the existing matplotlib outputs.
+    All rendering is offscreen so no display is required.
+
+    Parameters
+    ----------
+    state_path_or_dir : str or Path
+        Path to a ``fields_XXXXXX.npz`` state file or its parent ``states/`` dir.
+    mesh_path_or_dir : str or Path
+        Path to the mesh ``.npz`` file or its parent ``mesh/`` dir.
+    field : str
+        One of ``speed``, ``u``, ``v``, ``p``, ``k``, ``omega``, ``nu_t``.
+    cmap : str
+        Matplotlib/PyVista colormap name.
+    output_dir : str or Path or None
+        Where to save the PNG; defaults to the ``postproc/`` directory.
+    window_size : tuple
+        Render window size in pixels ``(width, height)``.
+    show_edges : bool
+        Draw cell edges on the mesh.
+    show_bounds : bool
+        Add axis grid/bounds annotation.
+
+    Returns
+    -------
+    Path
+        Path to the saved screenshot PNG.
+    """
+    pv = _pyvista_import()
+
+    state_path = _resolve_state_path(state_path_or_dir)
+    mesh_path  = _resolve_mesh_path(mesh_path_or_dir)
+    mesh_data  = np.load(mesh_path)
+    state      = np.load(state_path)
+
+    phi, label, key = _pyvista_resolve_field(state, mesh_data, field)
+    grid = _pyvista_build_grid(mesh_data, phi, label)
+
+    title = label
+    if "step" in state and "time" in state:
+        title = f"{label}  |  step {int(state['step'])}  |  t = {float(state['time']):.3e}"
+
+    stats = (f"min {np.nanmin(phi):.3e}   max {np.nanmax(phi):.3e}   "
+             f"mean {np.nanmean(phi):.3e}")
+
+    plotter = pv.Plotter(off_screen=True, window_size=list(window_size))
+    plotter.add_mesh(
+        grid,
+        scalars=label,
+        cmap=cmap,
+        show_edges=show_edges,
+        scalar_bar_args={"title": label, "vertical": True,
+                         "title_font_size": 12, "label_font_size": 11},
+    )
+    if show_bounds:
+        plotter.show_bounds(grid=True, font_size=9)
+    plotter.view_xy()
+    plotter.add_title(title, font_size=10)
+    plotter.add_text(stats, position="lower_left", font_size=8)
+
+    post_dir = _resolve_postproc_dir(output_dir, state_path=state_path, mesh_path=mesh_path)
+    post_dir.mkdir(parents=True, exist_ok=True)
+    save_path = post_dir / f"{state_path.stem}_{key}_pv.png"
+    plotter.screenshot(str(save_path))
+    plotter.close()
+    return save_path
+
+
+def pyvista_field_array(
+    fields,
+    mesh,
+    field="speed",
+    step=None,
+    time=None,
+    output_dir=None,
+    cmap="viridis",
+    window_size=(1400, 500),
+    show_edges=False,
+    show_bounds=True,
+):
+    """
+    Render a 2D scalar field from in-memory arrays using PyVista.
+
+    Same as :func:`pyvista_field` but operates on live solver arrays rather
+    than saved ``.npz`` files.  Useful for in-situ post-processing.
+
+    Parameters
+    ----------
+    fields : dict
+        Solver field dict (ghosted arrays).
+    mesh : dict
+        Loaded mesh dict.
+    field : str
+        One of ``speed``, ``u``, ``v``, ``p``, ``k``, ``omega``, ``nu_t``.
+    step, time : int/float or None
+        Appended to the title if provided.
+    output_dir : str or Path or None
+        Output directory; defaults to ``"."`` when None.
+    """
+    pv = _pyvista_import()
+
+    node = mesh["node"]
+    count_i = node.shape[0] - 1
+    count_j = node.shape[1] - 1
+
+    key = field.lower()
+    if key in ("speed", "vmag", "velocity"):
+        u = _cell_field_array(fields["u"], count_i, count_j)
+        v = _cell_field_array(fields["v"], count_i, count_j)
+        phi = np.hypot(u, v)
+        label = "velocity magnitude"
+    else:
+        field_map = {"u": "u", "v": "v", "p": "p", "k": "k",
+                     "omega": "omega", "nu_t": "nu_t"}
+        if key not in field_map:
+            raise ValueError(
+                f"field must be one of: speed, u, v, p, k, omega, nu_t  (got '{field}')"
+            )
+        phi  = _cell_field_array(fields[key], count_i, count_j)
+        label = key
+
+    grid = _pyvista_build_grid(mesh, phi, label)
+
+    title = label
+    if step is not None and time is not None:
+        title = f"{label}  |  step {int(step)}  |  t = {float(time):.3e}"
+
+    stats = (f"min {np.nanmin(phi):.3e}   max {np.nanmax(phi):.3e}   "
+             f"mean {np.nanmean(phi):.3e}")
+
+    plotter = pv.Plotter(off_screen=True, window_size=list(window_size))
+    plotter.add_mesh(
+        grid,
+        scalars=label,
+        cmap=cmap,
+        show_edges=show_edges,
+        scalar_bar_args={"title": label, "vertical": True,
+                         "title_font_size": 12, "label_font_size": 11},
+    )
+    if show_bounds:
+        plotter.show_bounds(grid=True, font_size=9)
+    plotter.view_xy()
+    plotter.add_title(title, font_size=10)
+    plotter.add_text(stats, position="lower_left", font_size=8)
+
+    post_dir = Path(output_dir) if output_dir is not None else Path(".")
+    post_dir.mkdir(parents=True, exist_ok=True)
+    if step is None:
+        save_path = post_dir / f"{key}_pv.png"
+    else:
+        save_path = post_dir / f"fields_{int(step):06d}_{key}_pv.png"
+
+    plotter.screenshot(str(save_path))
+    plotter.close()
+    return save_path
+
+
+def pyvista_vectors(
+    state_path_or_dir,
+    mesh_path_or_dir,
+    output_dir=None,
+    cmap="coolwarm",
+    scale=None,
+    stride=1,
+    window_size=(1400, 500),
+):
+    """
+    Render velocity vector arrows using PyVista glyphs.
+
+    Parameters
+    ----------
+    state_path_or_dir : str or Path
+        Path to a ``fields_XXXXXX.npz`` state file or its ``states/`` dir.
+    mesh_path_or_dir : str or Path
+        Path to the mesh ``.npz`` file or its ``mesh/`` dir.
+    output_dir : str or Path or None
+        Output directory; defaults to the ``postproc/`` directory.
+    cmap : str
+        Colormap for arrow colouring (by velocity magnitude).
+    scale : float or None
+        Arrow scale factor.  If ``None``, PyVista auto-scales by magnitude.
+    stride : int
+        Sub-sample every *stride* cells in each direction to reduce clutter
+        on dense meshes.  ``stride=1`` plots every cell.
+    window_size : tuple
+        Render window pixel dimensions ``(width, height)``.
+
+    Returns
+    -------
+    Path
+        Path to the saved screenshot PNG.
+    """
+    pv = _pyvista_import()
+
+    state_path = _resolve_state_path(state_path_or_dir)
+    mesh_path  = _resolve_mesh_path(mesh_path_or_dir)
+    mesh_data  = np.load(mesh_path)
+    state      = np.load(state_path)
+
+    node    = mesh_data["node"]
+    count_i = node.shape[0] - 1
+    count_j = node.shape[1] - 1
+
+    u_int = _cell_field(state, "u", count_i, count_j)   # (Ni, Nj)
+    v_int = _cell_field(state, "v", count_i, count_j)
+    speed = np.hypot(u_int, v_int)
+    cc    = mesh_data["cell_center"]                     # (Ni, Nj, 2)
+
+    # Sub-sample with stride
+    sl = (slice(None, None, stride), slice(None, None, stride))
+    cc_s    = cc[sl]
+    u_s     = u_int[sl]
+    v_s     = v_int[sl]
+    speed_s = speed[sl]
+
+    n_pts = cc_s.shape[0] * cc_s.shape[1]
+    points  = np.zeros((n_pts, 3))
+    points[:, 0] = cc_s[:, :, 0].flatten(order="F")
+    points[:, 1] = cc_s[:, :, 1].flatten(order="F")
+
+    vectors = np.zeros((n_pts, 3))
+    vectors[:, 0] = u_s.flatten(order="F")
+    vectors[:, 1] = v_s.flatten(order="F")
+
+    cloud = pv.PolyData(points)
+    cloud["vectors"] = vectors
+    cloud["speed"]   = speed_s.flatten(order="F")
+
+    glyph_kw = dict(orient="vectors", scale="speed", factor=1.0)
+    if scale is not None:
+        glyph_kw = dict(orient="vectors", scale=False, factor=float(scale))
+    glyphs = cloud.glyph(**glyph_kw)
+
+    title = "velocity vectors"
+    if "step" in state and "time" in state:
+        title = f"velocity vectors  |  step {int(state['step'])}  |  t = {float(state['time']):.3e}"
+
+    plotter = pv.Plotter(off_screen=True, window_size=list(window_size))
+    plotter.add_mesh(
+        glyphs,
+        scalars="speed",
+        cmap=cmap,
+        scalar_bar_args={"title": "|U|", "vertical": True},
+    )
+    plotter.view_xy()
+    plotter.add_title(title, font_size=10)
+
+    post_dir = _resolve_postproc_dir(output_dir, state_path=state_path, mesh_path=mesh_path)
+    post_dir.mkdir(parents=True, exist_ok=True)
+    save_path = post_dir / f"{state_path.stem}_vectors_pv.png"
+    plotter.screenshot(str(save_path))
+    plotter.close()
+    return save_path

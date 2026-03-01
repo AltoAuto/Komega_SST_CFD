@@ -1101,7 +1101,7 @@ def update_turbulence(fields, mesh, turb_cfg, bc_cfg, dt, nu, use_rhie_chow=True
             return
 
     model = turb_cfg.get("model")
-    if model not in ("k_omega",):
+    if model not in ("k_omega", "sst"):
         raise NotImplementedError(f"Unknown turbulence model: {model}")
     turbulence.initialize(fields, mesh, turb_cfg)
     turbulence.apply_bcs(fields, mesh, bc_cfg, turb_cfg, nu)
@@ -1119,9 +1119,9 @@ def update_turbulence(fields, mesh, turb_cfg, bc_cfg, dt, nu, use_rhie_chow=True
 
     grad_u = grad_scalar(fields["u"], mesh)
     grad_v = grad_scalar(fields["v"], mesh)
-    source_k, source_other = turbulence.sources(fields, grad_u, grad_v)
-    nu_k = turbulence.effective_diffusivity(nu, nu_t, field="k")[1:-1, 1:-1]
-    nu_other = turbulence.effective_diffusivity(nu, nu_t, field="omega")[1:-1, 1:-1]
+    source_k, source_other = turbulence.sources(fields, grad_u, grad_v, mesh=mesh)
+    nu_k = turbulence.effective_diffusivity(nu, nu_t, field="k", fields=fields)[1:-1, 1:-1]
+    nu_other = turbulence.effective_diffusivity(nu, nu_t, field="omega", fields=fields)[1:-1, 1:-1]
 
     a_k, b_k, _ = _assemble_implicit_system(
         fields["k"], mesh, nu_k, dt, adv_k + source_k, bc_cfg=bc_cfg
